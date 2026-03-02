@@ -14,9 +14,7 @@ echo "Starting Simple Customer Service Website Services..."
 
 # 1. Start the API Server
 echo "Starting Website API Server on port 8081..."
-cd packages/website-api-server
-python3 server.py &
-cd ../..
+uv run python packages/website-api-server/server.py &
 
 # 2. Start the Customer Feedback Website
 echo "Starting Customer Feedback Website..."
