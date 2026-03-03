@@ -3,6 +3,7 @@ import os
 import json
 import uuid
 from datetime import datetime
+import aiohttp
 import aiohttp.web
 from aiohttp import WSMessage, WSMsgType
 
@@ -15,6 +16,75 @@ active_chats = {} # chat_id -> chat_info
 customer_connections = {} # customer_email -> ws
 admin_connections = set() # set of admin ws
 
+ADK_BASE_URL = os.getenv('ADK_BASE_URL', 'http://localhost:8000')
+APP_NAME = "ai_agents"
+USER_ID = "admin-dashboard"
+
+async def get_ai_suggestion(chat_id, messages):
+    session_id = f"session-{chat_id}"
+    
+    # ADK uses specific user and session paths
+    session_url = f"{ADK_BASE_URL}/apps/{APP_NAME}/users/{USER_ID}/sessions/{session_id}"
+    run_url = f"{ADK_BASE_URL}/run"
+
+    print(f"\n--- REQUESTING AI SUGGESTION ---")
+    print(f"Chat ID: {chat_id}")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Ensure session exists (ADK requires this)
+            # Use GET first to see if it exists, or just catch the 409
+            async with session.get(session_url) as resp:
+                if resp.status != 200:
+                    async with session.post(session_url, json={}) as post_resp:
+                        pass
+
+            # 2. Format the latest message for ADK
+            # In a suggestion context, we send the whole history as a single turn
+            # or just the last customer message. Let's send the last message but
+            # include the previous history in the prompt for context.
+            
+            history_str = ""
+            for msg in messages[:-1]:
+                role = "Customer" if msg['sender'] == 'customer' else "You"
+                history_str += f"{role}: {msg['text']}\n"
+            
+            last_msg = messages[-1]['text'] if messages else "Hi"
+            prompt = f"History:\n{history_str}\nLatest Customer Message: {last_msg}\nSuggest a response based on your system instruction."
+
+            print(f"Sending Prompt to ADK: {prompt}...")
+
+            # 3. Run the agent
+            payload = {
+                "app_name": APP_NAME,
+                "user_id": USER_ID,
+                "session_id": session_id,
+                "new_message": {
+                    "role": "user",
+                    "parts": [{"text": prompt}]
+                }
+            }
+            
+            async with session.post(run_url, json=payload) as resp:
+                if resp.status == 200:
+                    events = await resp.json()
+                    assistant_text = ""
+                    for event in events:
+                        if "content" in event:
+                            parts = event["content"].get("parts", [])
+                            if parts and "text" in parts[0]:
+                                assistant_text += parts[0]["text"]
+                    
+                    print(f"AI Suggestion Received: {assistant_text[:100]}...")
+                    return assistant_text or "No suggestion generated."
+                else:
+                    error_text = await resp.text()
+                    print(f"ADK Server Error ({resp.status}): {error_text}")
+                    return f"ADK Server Error: {resp.status}"
+    except Exception as e:
+        print(f"Connection to AI Brain failed: {str(e)}")
+        return f"Connection to AI Brain failed: {str(e)}"
+
 async def handle_customer_ws(ws, email):
     customer_connections[email] = ws
     try:
@@ -22,6 +92,7 @@ async def handle_customer_ws(ws, email):
             if msg.type == WSMsgType.TEXT:
                 data = json.loads(msg.data)
                 action = data.get('action')
+                print(f"[WS CUSTOMER] Action: {action}, Data: {data}")
                 
                 if action == 'start_chat':
                     chat_id = str(uuid.uuid4())
@@ -66,6 +137,9 @@ async def handle_customer_ws(ws, email):
                             'chatId': chat_id,
                             'message': message
                         })
+
+                        # Auto-trigger AI suggestion for admins
+                        asyncio.create_task(broadcast_suggestion_to_admins(chat_id))
             elif msg.type == WSMsgType.ERROR:
                 print(f'Customer ws closed with exception {ws.exception()}')
     finally:
@@ -85,8 +159,29 @@ async def handle_admin_ws(ws):
             if msg.type == WSMsgType.TEXT:
                 data = json.loads(msg.data)
                 action = data.get('action')
+                print(f"[WS ADMIN] Action: {action}, Data: {data}")
                 
-                if action == 'send_message':
+                if action == 'get_history':
+                    chat_id = data.get('chatId')
+                    if chat_id in active_chats:
+                        await ws.send_json({
+                            'type': 'chat_history',
+                            'chatId': chat_id,
+                            'chat': active_chats[chat_id]
+                        })
+
+                elif action == 'request_ai_suggestion':
+                    chat_id = data.get('chatId')
+                    if chat_id in active_chats:
+                        chat = active_chats[chat_id]
+                        suggestion = await get_ai_suggestion(chat_id, chat['messages'])
+                        await ws.send_json({
+                            'type': 'ai_suggestion',
+                            'chatId': chat_id,
+                            'suggestion': suggestion
+                        })
+
+                elif action == 'send_message':
                     chat_id = data.get('chatId')
                     text = data.get('text')
                     if chat_id in active_chats:
@@ -123,6 +218,16 @@ def broadcast_to_admins(data, skip_ws=None):
     for ws in admin_connections:
         if ws != skip_ws:
             asyncio.create_task(ws.send_json(data))
+
+async def broadcast_suggestion_to_admins(chat_id):
+    if chat_id in active_chats:
+        chat = active_chats[chat_id]
+        suggestion = await get_ai_suggestion(chat_id, chat['messages'])
+        broadcast_to_admins({
+            'type': 'ai_suggestion',
+            'chatId': chat_id,
+            'suggestion': suggestion
+        })
 
 async def websocket_handler(request):
     ws = aiohttp.web.WebSocketResponse()
